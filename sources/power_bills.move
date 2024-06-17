@@ -4,16 +4,23 @@ module power_bills::power_bills {
     use sui::coin::{Self, Coin};
     use sui::clock::{Self, Clock};
     use sui::balance::{Self, Balance};
+    use sui::table::{Self, Table};
 
     // Struct definitions
     // struct to represent contractCap
-    public struct ContractCap has key, store {
+    public struct Contract has key, store {
         id: UID, // Unique identifier for the contractCap
         contract: address, // Address of the contract
         unit_price: u64, // Price per unit of power
+        bills: Table<address, Bill>,
         wallet: Balance<SUI>, // Balance of the contract
         overdue_fee: u64, // Fee for overdue bills
         min_date_overdue: u64, // Minimum date for overdue
+    }
+
+    public struct ContractCap has key {
+        id: UID,
+        to: ID
     }
 
     // Struct to represent a customer
@@ -21,14 +28,12 @@ module power_bills::power_bills {
         id: UID, // Unique identifier for the customer
         user_code: String, // code of the customer bill meter
         wallet: Balance<SUI>, // Balance of SUI tokens
-        bills: vector<Bill>, // Vector of bills for the customer
         units: u64, // Units of power consumed
         principal_address: address, // Principal address of the customer
     }
 
     // Struct to represent a bill
-    public struct Bill has key, store {
-        id: UID, // Unique identifier for the bill
+    public struct Bill has copy, drop, store {
         customer_id: ID, // ID of the customer associated with the bill
         units: u64, // Units of power bought
         amount: u64, // Amount of the bill in SUI tokens
@@ -47,20 +52,23 @@ module power_bills::power_bills {
     fun init(
         ctx: &mut TxContext
     ) {
+        let id_ = object::new(ctx);
+        let inner_ = object::uid_to_inner(&id_);
         // Create a new contract object
-        let contractCap = ContractCap {
-            id: object::new(ctx),
+        transfer::share_object(Contract {
+            id: id_,
             contract: tx_context::sender(ctx),
             unit_price: 10, // Price per unit of power
+            bills: table::new(ctx),
             overdue_fee: 5, // Fee for overdue bills
             wallet: balance::zero<SUI>(), // Initial balance of the contract
             min_date_overdue: 1000000, // Minimum timestamp date for overdue
+        });
+        let cap = ContractCap {
+            id: object::new(ctx),
+            to: inner_
         };
-
-        let contractCap_address = tx_context::sender(ctx);
-        
-        // Transfer the contract object to the contract owner
-        transfer::transfer(contractCap, contractCap_address);
+        transfer::transfer(cap, ctx.sender());
     }
 
     // Function to register a new customer
@@ -74,7 +82,6 @@ module power_bills::power_bills {
             id,
             user_code,
             wallet: balance::zero<SUI>(),
-            bills: vector::empty<Bill>(),
             units: 0,
             principal_address,
         }
@@ -83,32 +90,25 @@ module power_bills::power_bills {
     // function for customer to request units
     public fun request_units(
         customer: &mut Customer,
-        contractCap: &ContractCap,
+        self: &mut Contract,
         units: u64,
         clock: &Clock,
         ctx: &mut TxContext
     ) {
-        // Ensure the caller is the owner of the customer
-        assert!(customer.principal_address == tx_context::sender(ctx), EInvalidCustomer);
-
         // add the units to the customer
         customer.units = customer.units + units;
-
         // calculate the amount
-        let amount = units * contractCap.unit_price;
-
+        let amount = units * self.unit_price;
         // generate a new bill
         let bill = Bill {
-            id: object::new(ctx),
             customer_id: object::id(customer),
             units,
             amount,
-            due_date: clock::timestamp_ms(clock) + contractCap.min_date_overdue, // Due date is 1 day from now
+            due_date: clock::timestamp_ms(clock) + self.min_date_overdue, // Due date is 1 day from now
             payment_status: false, // Payment status is false
         };
-
         // add the bill to the customer
-        vector::push_back(&mut customer.bills, bill);
+        table::add(&mut self.bills, ctx.sender(), bill);
     }
 
     // Function to deposit funds into a customer's wallet
@@ -117,66 +117,19 @@ module power_bills::power_bills {
         amount: Coin<SUI>,
         ctx: &mut TxContext
     ) {
-        // Ensure the caller is the customer
-        assert!(customer.principal_address == tx_context::sender(ctx), EInvalidCustomer);
-
-        let coin = coin::into_balance(amount);
-        balance::join(&mut customer.wallet, coin);
+        coin::put(&mut customer.wallet, amount);
     }
 
     // Function to pay a bill
-    public fun pay_bill_from_wallet(
+    public fun pay_bill(
         customer: &mut Customer,
-        contractCap: &mut ContractCap,
-        bill: &mut Bill,
+        self: &mut Contract,
         ctx: &mut TxContext
     ) {
-        // Ensure the caller is  the customer
-        assert!(customer.principal_address == tx_context::sender(ctx), EInvalidCustomer);
-        // Ensure the bill is valid
-        assert!(bill.customer_id == object::id(customer), EInvalidBill);
-        // Ensure the bill is unpaid
-        assert!((!bill.payment_status), EInvalidBill);
-
-        // Ensure the customer has sufficient wallet
-        assert!(balance::value(&customer.wallet) >= bill.amount, EInsufficientBallance);
-
+        let bill = table::remove(&mut self.bills, ctx.sender());
         // Transfer the bill amount from the customer to the contract
         let bill_amount = coin::take(&mut customer.wallet, (bill.amount), ctx);
-
-        transfer::public_transfer(bill_amount, contractCap.contract);
-
-        // Mark the bill as paid
-        bill.payment_status = true;
-    }
-
-    // pay bill directly
-    public fun pay_bill_directly(
-        customer: &mut Customer,
-        contractCap: &mut ContractCap,
-        bill: &mut Bill,
-        amount: Coin<SUI>,
-        ctx: &mut TxContext
-    ) {
-        // Ensure the caller is the owner of the customer
-        assert!(customer.principal_address == tx_context::sender(ctx), EInvalidCustomer);
-        // Ensure the bill is valid
-        assert!(bill.customer_id == object::id(customer), EInvalidBill);
-        // Ensure the bill is unpaid
-        assert!((!bill.payment_status), EInvalidBill);
-
-        // calculate the amount
-        let pay_amount = coin::value(&amount);
-
-        // check amount is greater than bill amount
-        assert!(pay_amount >= bill.amount, EInsufficientBallance);
-
-        // Transfer the bill amount from the customer to the contract
-        let bill_amount = coin::into_balance(amount);
-        balance::join(&mut contractCap.wallet, bill_amount);
-
-        // Mark the bill as paid
-        bill.payment_status = true;
+        coin::put(&mut self.wallet, bill_amount);
     }
 
     // update customer power usage
@@ -187,7 +140,6 @@ module power_bills::power_bills {
     ) {
         // Ensure the caller is the owner of the customer
         assert!(customer.principal_address == tx_context::sender(ctx), EInvalidCustomer);
-
         // add the units to the customer
         customer.units = customer.units - units;
     }
@@ -197,16 +149,9 @@ module power_bills::power_bills {
         customer: &mut Customer,
         amount: u64,
         ctx: &mut TxContext
-    ) {
-        // Ensure the caller is the owner of the customer
-        assert!(customer.principal_address == tx_context::sender(ctx), ENotAuthorized);
-
-        // Ensure the customer has sufficient balance
-        assert!(balance::value(&customer.wallet) >= amount, EInsufficientBallance);
-
-        // Transfer the amount from the customer's wallet
-        let withdraw_amount = coin::take(&mut customer.wallet, amount, ctx);
-        transfer::public_transfer(withdraw_amount, customer.principal_address);
+    ) : Coin<SUI> {
+        let coin = coin::take(&mut customer.wallet, amount, ctx);
+        coin 
     }
 
     // function for customer to view remaining units
@@ -214,54 +159,5 @@ module power_bills::power_bills {
         customer: &Customer,
     ) : u64 {
         customer.units
-    }
-
-    // function for customer to view unpaid bills
-    public fun view_unpaid_bills(
-        customer: &Customer,
-    ) : vector<ID> {
-        let mut unpaid_bills = vector::empty<ID>();
-        let len: u64 = vector::length(&customer.bills);
-
-        let mut i = 0_u64;
-
-        while (i < len) {
-            let bill = &customer.bills[i];
-
-            if (!bill.payment_status) {
-                let id = object::uid_to_inner(&bill.id);
-                unpaid_bills.push_back(id);
-            };
-
-            i = i + 1;
-        };
-
-        unpaid_bills
-    }
-
-    // function for contract to charge late fees
-    public fun apply_late_fees(
-        customer: &mut Customer,
-        contractCap: &ContractCap,
-        clock: &Clock,
-        _ctx: &mut TxContext
-    ) {
-        let len: u64 = vector::length(&customer.bills);
-
-        let mut i = 0_u64;
-
-        while (i < len) {
-            let bill = &mut customer.bills[i];
-
-            if ((!bill.payment_status) && (bill.due_date < clock::timestamp_ms(clock))) {
-                let overdue_fee = contractCap.overdue_fee;
-                let amount = bill.amount + overdue_fee;
-
-                // update the bill amount
-                bill.amount = amount;
-            };
-
-            i = i + 1;
-        };
     }
 }
